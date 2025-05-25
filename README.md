@@ -1,4 +1,4 @@
-# eye_dentify
+# EyeDentify 
 
 A new Flutter project.
 
