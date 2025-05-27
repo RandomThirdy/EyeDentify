@@ -1,8 +1,6 @@
-import 'dart:io';
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
-import 'package:speech_to_text/speech_to_text.dart';
-import 'package:flutter_tts/flutter_tts.dart';
 import '../services/tflite_service.dart';
 
 class CameraPage extends StatefulWidget {
@@ -24,34 +22,42 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
   bool _isInitialized = false;
   bool _isDetecting = false;
   final TFLiteService _tfliteService = TFLiteService();
-  final SpeechToText _speechToText = SpeechToText();
-  final FlutterTts _flutterTts = FlutterTts();
   List<Map<String, dynamic>> _detectedObjects = [];
-  bool _isContinuousDetection = false;
-  DateTime _lastDetectionTime = DateTime.now();
-  static const Duration _detectionInterval = Duration(milliseconds: 500);
+  
+  // Optimized performance variables
+  int _frameSkipCounter = 0;
+  static const int _frameSkipRate = 1;
+  bool _isStreamActive = false;
+  
+  // Detection queue for smooth processing
+  final List<CameraImage> _frameQueue = [];
+  bool _isProcessingQueue = false;
+  Timer? _detectionTimer;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _initializeCamera();
-    _initializeSpeech();
-    _initializeTTS();
     _initializeTFLite();
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _detectionTimer?.cancel();
+    _controller?.stopImageStream();
     _controller?.dispose();
     _tfliteService.dispose();
+    _frameQueue.clear();
     super.dispose();
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.inactive) {
+      _detectionTimer?.cancel();
+      _controller?.stopImageStream();
       _controller?.dispose();
     } else if (state == AppLifecycleState.resumed) {
       _initializeCamera();
@@ -60,15 +66,23 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
 
   Future<void> _initializeCamera() async {
     if (widget.cameras.isEmpty) {
-      await _flutterTts.speak('No camera found on this device');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('No camera found on this device'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
       return;
     }
 
     try {
       _controller = CameraController(
         widget.cameras.first,
-        ResolutionPreset.medium,
+        ResolutionPreset.medium, // Lower resolution for better performance
         enableAudio: false,
+        imageFormatGroup: ImageFormatGroup.yuv420,
       );
 
       await _controller!.initialize();
@@ -78,18 +92,10 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
       setState(() {
         _isInitialized = true;
       });
-      
-      // Start preview
-      await _controller!.setFocusMode(FocusMode.auto);
-      await _controller!.setExposureMode(ExposureMode.auto);
 
-      // Start continuous detection if in object detection mode
-      if (widget.mode == 'objectDetection') {
-        setState(() {
-          _isContinuousDetection = true;
-        });
-        _startContinuousDetection();
-      }
+      // Start continuous detection
+      await _startContinuousDetection();
+      
     } catch (e) {
       print('Error initializing camera: $e');
       if (mounted) {
@@ -99,126 +105,88 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
             backgroundColor: Colors.red,
           ),
         );
-        await _flutterTts.speak('Failed to initialize camera. Please check camera permissions.');
       }
     }
   }
 
   Future<void> _startContinuousDetection() async {
-    while (_isContinuousDetection && mounted) {
-      try {
-        if (!_isDetecting && 
-            DateTime.now().difference(_lastDetectionTime) > _detectionInterval) {
-          await _detectObjects();
-        }
-        await Future.delayed(const Duration(milliseconds: 100));
-      } catch (e) {
-        print('Error in continuous detection: $e');
-        // Don't stop the loop on error, just continue
-      }
-    }
-  }
-
-  Future<void> _initializeSpeech() async {
-    await _speechToText.initialize();
-  }
-
-  Future<void> _initializeTTS() async {
-    await _flutterTts.setLanguage('en-US');
-  }
-
-  Future<void> _initializeTFLite() async {
-    try {
-      await _tfliteService.initialize();
-    } catch (e) {
-      print('Error initializing TFLite: $e');
-    }
-  }
-
-  Future<void> _startListening() async {
-    if (!_speechToText.isAvailable) return;
-
-    await _speechToText.listen(
-      onResult: (result) {
-        if (result.finalResult) {
-          _processVoiceCommand(result.recognizedWords.toLowerCase());
-        }
-      },
-    );
-  }
-
-  Future<void> _processVoiceCommand(String command) async {
-    if (command.contains('what') && (command.contains('front') || command.contains('see'))) {
-      await _flutterTts.speak('I will scan what is in front of you');
-      await _detectObjects();
-    } else if (command.contains('detect') || command.contains('scan')) {
-      await _detectObjects();
-    } else if (command.contains('stop') || command.contains('pause')) {
-      setState(() {
-        _isContinuousDetection = false;
-      });
-      await _flutterTts.speak('Object detection paused');
-    } else if (command.contains('start') || command.contains('resume')) {
-      setState(() {
-        _isContinuousDetection = true;
-      });
-      await _flutterTts.speak('Resuming object detection');
-      _startContinuousDetection();
-    }
-  }
-
-  Future<void> _detectObjects() async {
-    if (!_isInitialized || _isDetecting) return;
-
+    if (!_isInitialized || _controller == null || _isStreamActive) return;
+    
+    print('Starting continuous real-time detection...');
+    
     setState(() {
-      _isDetecting = true;
+      _frameSkipCounter = 0;
+      _isStreamActive = true;
     });
 
     try {
-      if (_controller == null || !_controller!.value.isInitialized) {
-        throw Exception('Camera not initialized');
-      }
+      // Start image stream
+      await _controller!.startImageStream((CameraImage image) {
+        _frameSkipCounter++;
+        if (_frameSkipCounter % (_frameSkipRate + 1) != 0) {
+          return;
+        }
 
-      final image = await _controller!.takePicture();
-      if (!mounted) return;
-
-      final results = await _tfliteService.detectObjects(File(image.path));
-      
-      if (!mounted) return;
-      
-      setState(() {
-        _detectedObjects = results;
-        _lastDetectionTime = DateTime.now();
+        // Add frame to queue for processing
+        _addFrameToQueue(image);
       });
 
-      // Announce results with more natural language
-      if (results.isNotEmpty) {
-        String message;
-        if (results.length == 1) {
-          final obj = results.first;
-          message = 'I can see a ${obj['class']} with ${(obj['confidence'] * 100).toStringAsFixed(1)}% confidence';
-        } else {
-          final objects = results.map((obj) => 
-            '${obj['class']}'
-          ).join(', ');
-          message = 'I can see multiple objects: $objects';
-        }
-        await _flutterTts.speak(message);
-      } else {
-        await _flutterTts.speak('I cannot detect any objects at the moment');
-      }
+      // Start continuous processing timer
+      _startProcessingTimer();
+      
     } catch (e) {
-      print('Error detecting objects: $e');
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Error detecting objects: ${e.toString()}'),
-            backgroundColor: Colors.red,
-          ),
-        );
-        await _flutterTts.speak('Sorry, I encountered an error while detecting objects');
+      print('Error starting image stream: $e');
+      setState(() {
+        _isStreamActive = false;
+      });
+    }
+  }
+
+  void _addFrameToQueue(CameraImage image) {
+    // Keep queue size manageable - only keep latest frames
+    if (_frameQueue.length > 2) {
+      _frameQueue.removeAt(0);
+    }
+    _frameQueue.add(image);
+  }
+
+  void _startProcessingTimer() {
+    // Process frames at regular intervals for smooth detection
+    _detectionTimer = Timer.periodic(const Duration(milliseconds: 100), (timer) {
+      if (!_isProcessingQueue && _frameQueue.isNotEmpty && mounted) {
+        _processNextFrame();
       }
+    });
+  }
+
+  Future<void> _processNextFrame() async {
+    if (_frameQueue.isEmpty || _isProcessingQueue || !mounted) return;
+    
+    _isProcessingQueue = true;
+    
+    setState(() {
+      _isDetecting = true;
+    });
+    
+    try {
+      final image = _frameQueue.removeAt(0);
+      
+      // Process the camera stream directly with your TFLite model
+      final results = await _tfliteService.detectObjectsFromStream(image);
+      
+      if (!mounted) return;
+      
+      // Convert results for display overlay
+      final displayResults = _convertResultsForDisplay(results);
+      
+      setState(() {
+        _detectedObjects = displayResults;
+      });
+      
+    } catch (e) {
+      print('Error processing frame: $e');
     } finally {
+      _isProcessingQueue = false;
       if (mounted) {
         setState(() {
           _isDetecting = false;
@@ -227,61 +195,275 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
     }
   }
 
+  List<Map<String, dynamic>> _convertResultsForDisplay(List<Map<String, dynamic>> results) {
+    if (!mounted) return [];
+    
+    final screenSize = MediaQuery.of(context).size;
+    
+    return results.map((result) {
+      final box = result['box'] as Map<String, double>;
+      
+      // Convert normalized coordinates to screen coordinates
+      final left = box['centerX']! * screenSize.width - (box['width']! * screenSize.width / 2);
+      final top = box['centerY']! * screenSize.height - (box['height']! * screenSize.height / 2);
+      final width = box['width']! * screenSize.width;
+      final height = box['height']! * screenSize.height;
+      
+      return {
+        ...result,
+        'rect': Rect.fromLTWH(left, top, width, height),
+      };
+    }).toList();
+  }
+
+  Future<void> _initializeTFLite() async {
+    try {
+      await _tfliteService.initialize();
+      print('TFLite service initialized successfully');
+    } catch (e) {
+      print('Error initializing TFLite: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Failed to load AI model: ${e.toString()}'),
+            backgroundColor: Colors.orange,
+          ),
+        );
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     if (!_isInitialized) {
-      return const Scaffold(
+      return Scaffold(
+        backgroundColor: Colors.black,
         body: Center(
-          child: CircularProgressIndicator(),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const CircularProgressIndicator(
+                color: Colors.blue,
+                strokeWidth: 3,
+              ),
+              const SizedBox(height: 20),
+              Text(
+                'Initializing Camera & AI Model...',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 16,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+            ],
+          ),
         ),
       );
     }
 
-    final size = MediaQuery.of(context).size;
-    final scale = 1 / (_controller!.value.aspectRatio * size.aspectRatio);
-
     return Scaffold(
+      backgroundColor: Colors.black,
       appBar: AppBar(
-        title: Text(widget.mode == 'objectDetection' ? 'Object Detection' : 'Camera'),
-        actions: [
-          IconButton(
-            icon: Icon(_isContinuousDetection ? Icons.pause : Icons.play_arrow),
-            onPressed: () {
-              setState(() {
-                _isContinuousDetection = !_isContinuousDetection;
-              });
-              if (_isContinuousDetection) {
-                _startContinuousDetection();
-              }
-            },
-          ),
-        ],
+        title: Text(
+          'Continuous Detection',
+          style: TextStyle(fontWeight: FontWeight.bold),
+        ),
+        backgroundColor: Colors.black87,
+        foregroundColor: Colors.white,
+        elevation: 0,
       ),
       body: Stack(
         children: [
-          // Camera preview
-          Center(
-            child: Transform.scale(
-              scale: scale,
-              child: CameraPreview(_controller!),
-            ),
+          // Camera preview - full screen
+          Positioned.fill(
+            child: CameraPreview(_controller!),
           ),
-          // Object detection boxes
-          if (_detectedObjects.isNotEmpty)
-            CustomPaint(
+          
+          // Real-time detection overlay - Always visible
+          Positioned.fill(
+            child: CustomPaint(
               painter: ObjectDetectorPainter(
                 objects: _detectedObjects,
-                imageSize: size,
-                scale: scale,
               ),
             ),
-          // Voice command button
+          ),
+          
+          // Top status bar with live indicator
           Positioned(
-            bottom: 20,
-            right: 20,
-            child: FloatingActionButton(
-              onPressed: _startListening,
-              child: const Icon(Icons.mic),
+            top: 16,
+            left: 16,
+            right: 16,
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                // Live detection status
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: _isStreamActive ? Colors.green.withOpacity(0.9) : Colors.red.withOpacity(0.9),
+                    borderRadius: BorderRadius.circular(20),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withOpacity(0.3),
+                        blurRadius: 4,
+                        offset: Offset(0, 2),
+                      ),
+                    ],
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      // Pulsing live indicator
+                      TweenAnimationBuilder<double>(
+                        tween: Tween<double>(begin: 0.5, end: 1.0),
+                        duration: const Duration(milliseconds: 800),
+                        builder: (context, value, child) {
+                          return Container(
+                            width: 8,
+                            height: 8,
+                            margin: const EdgeInsets.only(right: 8),
+                            decoration: BoxDecoration(
+                              color: _isStreamActive 
+                                ? Colors.white.withOpacity(value)
+                                : Colors.white,
+                              shape: BoxShape.circle,
+                            ),
+                          );
+                        },
+                      ),
+                      Text(
+                        _isStreamActive ? 'LIVE' : 'OFFLINE',
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 12,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                
+                // Object count with fade animation
+                AnimatedOpacity(
+                  opacity: _detectedObjects.isNotEmpty ? 1.0 : 0.5,
+                  duration: const Duration(milliseconds: 300),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    decoration: BoxDecoration(
+                      color: Colors.blue.withOpacity(0.9),
+                      borderRadius: BorderRadius.circular(20),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withOpacity(0.3),
+                          blurRadius: 4,
+                          offset: Offset(0, 2),
+                        ),
+                      ],
+                    ),
+                    child: Text(
+                      '${_detectedObjects.length} objects',
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 12,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          
+          // Performance indicator
+          Positioned(
+            top: 70,
+            right: 16,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              decoration: BoxDecoration(
+                color: Colors.black.withOpacity(0.7),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Container(
+                    width: 6,
+                    height: 6,
+                    decoration: BoxDecoration(
+                      color: _isDetecting ? Colors.orange : Colors.green,
+                      shape: BoxShape.circle,
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    _isDetecting ? 'Processing' : 'Ready',
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 10,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          
+          // Bottom instruction panel
+          Positioned(
+            bottom: 32,
+            left: 16,
+            right: 16,
+            child: Container(
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                color: Colors.black.withOpacity(0.8),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(
+                  color: _isStreamActive ? Colors.green : Colors.red,
+                  width: 1,
+                ),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withOpacity(0.5),
+                    blurRadius: 8,
+                    offset: Offset(0, 4),
+                  ),
+                ],
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(
+                        Icons.videocam,
+                        color: _isStreamActive ? Colors.green : Colors.red,
+                        size: 20,
+                      ),
+                      const SizedBox(width: 8),
+                      Text(
+                        'Continuous Real-time Detection',
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 14,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    'Objects are detected continuously in real-time',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      color: Colors.white.withOpacity(0.8),
+                      fontSize: 12,
+                    ),
+                  ),
+                ],
+              ),
             ),
           ),
         ],
@@ -292,62 +474,94 @@ class _CameraPageState extends State<CameraPage> with WidgetsBindingObserver {
 
 class ObjectDetectorPainter extends CustomPainter {
   final List<Map<String, dynamic>> objects;
-  final Size imageSize;
-  final double scale;
 
   ObjectDetectorPainter({
     required this.objects,
-    required this.imageSize,
-    required this.scale,
   });
 
   @override
   void paint(Canvas canvas, Size size) {
-    final paint = Paint()
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 2.0
-      ..color = Colors.red;
-
-    final textPainter = TextPainter(
-      textDirection: TextDirection.ltr,
-    );
-
     for (var object in objects) {
       final rect = object['rect'] as Rect;
-      final scaledRect = Rect.fromLTWH(
-        rect.left * scale,
-        rect.top * scale,
-        rect.width * scale,
-        rect.height * scale,
-      );
+      final confidence = object['confidence'] as double;
+      final className = object['class'] as String;
+      
+      // Dynamic color based on confidence with smooth transitions
+      final Color boxColor = confidence > 0.7 
+          ? Colors.green 
+          : confidence > 0.5 
+              ? Colors.orange 
+              : Colors.red;
+      
+      // Box paint with animated stroke
+      final boxPaint = Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2.5
+        ..color = boxColor.withOpacity(0.9);
 
-      // Draw rectangle
-      canvas.drawRect(scaledRect, paint);
+      // Fill paint with subtle transparency
+      final fillPaint = Paint()
+        ..style = PaintingStyle.fill
+        ..color = boxColor.withOpacity(0.08);
 
-      // Draw label
-      final label = '${object['class']} ${(object['confidence'] * 100).toStringAsFixed(1)}%';
-      textPainter.text = TextSpan(
+      // Draw filled rectangle
+      canvas.drawRect(rect, fillPaint);
+      
+      // Draw border with rounded corners
+      final roundedRect = RRect.fromRectAndRadius(rect, Radius.circular(4));
+      canvas.drawRRect(roundedRect, boxPaint);
+
+      // Confidence and class label with better formatting
+      final label = '$className ${(confidence * 100).toStringAsFixed(0)}%';
+      final textSpan = TextSpan(
         text: label,
-        style: const TextStyle(
-          color: Colors.red,
-          fontSize: 14,
+        style: TextStyle(
+          color: Colors.white,
+          fontSize: 12,
           fontWeight: FontWeight.bold,
+          shadows: [
+            Shadow(
+              color: Colors.black.withOpacity(0.9),
+              offset: Offset(1, 1),
+              blurRadius: 3,
+            ),
+          ],
         ),
       );
-
+      
+      final textPainter = TextPainter(
+        text: textSpan,
+        textDirection: TextDirection.ltr,
+      );
+      
       textPainter.layout();
+      
+      // Label background with better positioning
+      final labelRect = Rect.fromLTWH(
+        rect.left,
+        rect.top - textPainter.height - 6,
+        textPainter.width + 10,
+        textPainter.height + 4,
+      );
+     
+      final backgroundPaint = Paint()
+        ..color = boxColor.withOpacity(0.95)
+        ..style = PaintingStyle.fill;
+
+      // Draw rounded label background
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(labelRect, Radius.circular(3)),
+        backgroundPaint,
+      );
+      
+      // Draw text
       textPainter.paint(
-        canvas,
-        Offset(
-          scaledRect.left,
-          scaledRect.top - textPainter.height,
-        ),
+        canvas, 
+        Offset(rect.left + 5, rect.top - textPainter.height - 2),
       );
     }
   }
 
   @override
-  bool shouldRepaint(ObjectDetectorPainter oldDelegate) {
-    return oldDelegate.objects != objects;
-  }
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
 }

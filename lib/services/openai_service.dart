@@ -5,7 +5,7 @@ import 'package:flutter/foundation.dart';
 class OpenAIService {
   // Important: In production, store this key securely, not hardcoded
   // Consider using environment variables, Flutter secure storage, or a backend service
-  
+
 
   /// Process a voice command through OpenAI to get intelligent responses
   /// and determine appropriate actions
